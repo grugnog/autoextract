@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"encoding/json"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -27,108 +26,144 @@ type Item struct {
 }
 
 type Script struct {
+	Sources map[string]Source `yaml:"sources"`
+}
+
+type Source struct {
 	Headers http.Header     `yaml:"headers"`
 	BaseURL string          `yaml:"baseurl"`
 	Items   map[string]Item `yaml:"items"`
 	colly.Collector
-	aLock                 *sync.RWMutex
 	processEntryCallbacks []ProcessEntryCallback
+	processErrorCallbacks []ProcessErrorCallback
+	pLock                 *sync.RWMutex
 }
-type ProcessEntryCallback func(*colly.Response, string, json.Number, string, interface{})
+type ProcessEntryCallback func(*colly.Response, string, json.Number, string, interface{}) error
+type ProcessErrorCallback func(*colly.Response, string, json.Number, string, interface{}, error)
 
-// OnProcessEntry registers a function. Function will be executed on every entry.
-func (s *Script) OnProcessEntry(f ProcessEntryCallback) {
-	s.aLock.Lock()
-	if s.processEntryCallbacks == nil {
-		s.processEntryCallbacks = make([]ProcessEntryCallback, 0, 4)
+// OnProcessEntry registers a function for  source. Function will be executed on every entry.
+func (source *Source) OnProcessEntry(f ProcessEntryCallback) {
+	source.pLock.Lock()
+	if source.processEntryCallbacks == nil {
+		source.processEntryCallbacks = make([]ProcessEntryCallback, 0, 4)
 	}
-	s.processEntryCallbacks = append(s.processEntryCallbacks, f)
-	s.aLock.Unlock()
+	source.processEntryCallbacks = append(source.processEntryCallbacks, f)
+	source.pLock.Unlock()
 }
+
+// OnProcessError registers a function. Function will be executed on error
+// during response parsing or processing.
+func (source *Source) OnProcessError(f ProcessErrorCallback) {
+	source.pLock.Lock()
+	if source.processErrorCallbacks == nil {
+		source.processErrorCallbacks = make([]ProcessErrorCallback, 0, 4)
+	}
+	source.processErrorCallbacks = append(source.processErrorCallbacks, f)
+	source.pLock.Unlock()
+}
+
 func NewScript() *Script {
 	script := &Script{}
-	script.aLock = &sync.RWMutex{}
 	return script
 }
 
-func NewScriptFromYAML(filename string) (*Script, error) {
-	script := NewScript()
-	yamlFile, err := ioutil.ReadFile("script.yaml")
-	if err != nil {
-		return script, errors.Wrapf(err, "could not read YAML file %s", filename)
-	}
-	err = yaml.Unmarshal(yamlFile, &script)
-	if err != nil {
-		return script, errors.Wrapf(err, "could not parse YAML file %s", filename)
-	}
-	return script, nil
+func NewSource() *Source {
+	source := &Source{}
+	source.Init()
+	source.pLock = &sync.RWMutex{}
+	return source
 }
 
-func (s *Script) processEntries(r *colly.Response, tableName string, item Item, jsonParsed *gabs.Container) error {
+func NewScriptFromYAML(filename string) (*Script, error) {
+	s := NewScript()
+	yamlFile, err := ioutil.ReadFile("script.yaml")
+	if err != nil {
+		return s, errors.Wrapf(err, "could not read YAML file %s", filename)
+	}
+	err = yaml.Unmarshal(yamlFile, &s)
+	if err != nil {
+		return s, errors.Wrapf(err, "could not parse YAML file %s", filename)
+	}
+	for k, source := range s.Sources {
+		source.Init()
+		source.pLock = &sync.RWMutex{}
+		s.Sources[k] = source
+	}
+	return s, nil
+}
+
+func (source *Source) processEntries(r *colly.Response, tableName string, item Item, jsonParsed *gabs.Container) {
 	children, err := jsonParsed.S(item.Entries).Children()
 	if err != nil {
-		return err
+		source.processErrors(r, tableName, "", "", jsonParsed.Data(), err)
 	}
 	for _, child := range children {
-		log.Println(child)
 		tasks, err := getTasks(item.Tasks)
 		if err != nil {
-			return err
+			source.processErrors(r, tableName, "", "", jsonParsed.Data(), err)
 		}
 		data, ok := child.Data().(map[string]interface{})
 		if !ok {
-			return errors.New("top level of each entry must be an object")
+			err = errors.New("top level of each entry must be an object")
+			source.processErrors(r, tableName, "", "", data, err)
 		}
 		data, err = executeTasks(tasks, data)
 		if err != nil {
-			return err
+			source.processErrors(r, tableName, "", "", data, err)
 		}
 		timestamp := time.Now().Format(time.RFC3339)
 		id := child.S(item.EntryID).Data().(json.Number)
 		if item.Timestamp != "" {
 			timestamp = child.S(item.Timestamp).Data().(string)
 		}
-		for _, f := range s.processEntryCallbacks {
-			f(r, tableName, id, timestamp, data)
+		source.pLock.RLock()
+		for _, f := range source.processEntryCallbacks {
+			err = f(r, tableName, id, timestamp, data)
+			if err != nil {
+				source.processErrors(r, tableName, id, timestamp, data, err)
+			}
 		}
+		source.pLock.RUnlock()
 	}
-	return nil
+}
+
+func (source *Source) processErrors(r *colly.Response, tableName string, id json.Number, timestamp string, data interface{}, err error) {
+	source.pLock.RLock()
+	for _, f := range source.processErrorCallbacks {
+		f(r, tableName, id, timestamp, data, err)
+	}
+	source.pLock.RUnlock()
 }
 
 func (s *Script) Execute() error {
-	c := colly.NewCollector()
-	err := c.Limit(&colly.LimitRule{
-		DomainRegexp: ".*",
-		Parallelism:  5,
-	})
-	if err != nil {
-		return errors.Wrap(err, "could not configure Colly limits")
-	}
-	c.CacheDir = "./cache"
-	for tableName, item := range s.Items {
-		c.OnResponse(func(r *colly.Response) {
-			jsonDecoder := json.NewDecoder(bytes.NewReader(r.Body))
-			jsonDecoder.UseNumber()
-			jsonParsed, err := gabs.ParseJSONDecoder(jsonDecoder)
-			if err != nil {
-				// TODO: Figure out how to better handle errors here.
-				log.Panicln(err)
-				return
-			}
-			err = s.processEntries(r, tableName, item, jsonParsed)
-			if err != nil {
-				log.Panicln(err)
-				return
-			}
-			for _, selector := range item.Follow {
-				url, ok := jsonParsed.Path(selector).Data().(string)
-				if ok {
-					c.Request("GET", url, nil, nil, s.Headers)
-				}
-			}
+	for _, source := range s.Sources {
+		err := source.Limit(&colly.LimitRule{
+			DomainRegexp: ".*",
+			Parallelism:  5,
 		})
-
-		c.Request("GET", s.BaseURL+item.Path, nil, nil, s.Headers)
+		if err != nil {
+			return errors.Wrap(err, "could not configure Colly limits")
+		}
+		source.SetRequestTimeout(time.Second * 5)
+		source.CacheDir = "./cache"
+		for tableName, item := range source.Items {
+			source.OnResponse(func(r *colly.Response) {
+				jsonDecoder := json.NewDecoder(bytes.NewReader(r.Body))
+				jsonDecoder.UseNumber()
+				jsonParsed, err := gabs.ParseJSONDecoder(jsonDecoder)
+				if err != nil {
+					source.processErrors(r, tableName, "", "", jsonParsed.Data(), err)
+				}
+				source.processEntries(r, tableName, item, jsonParsed)
+				for _, selector := range item.Follow {
+					url, ok := jsonParsed.Path(selector).Data().(string)
+					if ok {
+						source.Request("GET", url, nil, nil, source.Headers)
+					}
+				}
+			})
+			source.Request("GET", source.BaseURL+item.Path, nil, nil, source.Headers)
+		}
 	}
 	return nil
 }

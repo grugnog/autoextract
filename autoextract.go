@@ -3,8 +3,10 @@ package autoextract
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"net/http"
+	"net/url"
 	"sync"
 	"time"
 
@@ -17,12 +19,16 @@ import (
 )
 
 type Item struct {
-	Path      string              `yaml:"path"`
-	Entries   string              `yaml:"entries"`
-	EntryID   string              `yaml:"id"`
-	Timestamp string              `yaml:"timestamp"`
-	Follow    []string            `yaml:"follow"`
-	Tasks     []map[string]string `yaml:"tasks"`
+	Path            string              `yaml:"path"`
+	Entries         string              `yaml:"entries"`
+	EntryID         string              `yaml:"id"`
+	Timestamp       string              `yaml:"timestamp"`
+	TimestampFormat string              `yaml:"timestamp_format"`
+	Update          UpdateConfig        `yaml:"update"`
+	Follow          []string            `yaml:"follow"`
+	Tasks           []map[string]string `yaml:"tasks"`
+	watermark       time.Time
+	watermarkLock   *sync.RWMutex
 }
 
 type Script struct {
@@ -38,6 +44,15 @@ type Source struct {
 	processErrorCallbacks []ProcessErrorCallback
 	pLock                 *sync.RWMutex
 }
+
+type UpdateConfig struct {
+	FullFrequency        string `yaml:"full_frequency"`
+	IncrementalFrequency string `yaml:"incremental_frequency"`
+	IncrementalKey       string `yaml:"incremental_key"`
+	IncrementalValue     string `yaml:"incremental_value"`
+	IncrementalFormat    string `yaml:"incremental_format"`
+}
+
 type ProcessEntryCallback func(*colly.Response, string, json.Number, string, interface{}) error
 type ProcessErrorCallback func(*colly.Response, string, json.Number, string, interface{}, error)
 
@@ -92,7 +107,7 @@ func NewScriptFromYAML(filename string) (*Script, error) {
 	return s, nil
 }
 
-func (source *Source) processEntries(r *colly.Response, tableName string, item Item, jsonParsed *gabs.Container) {
+func (source *Source) processEntries(r *colly.Response, tableName string, item *Item, jsonParsed *gabs.Container) {
 	children, err := jsonParsed.S(item.Entries).Children()
 	if err != nil {
 		source.processErrors(r, tableName, "", "", jsonParsed.Data(), err)
@@ -114,7 +129,17 @@ func (source *Source) processEntries(r *colly.Response, tableName string, item I
 		timestamp := time.Now().Format(time.RFC3339)
 		id := child.S(item.EntryID).Data().(json.Number)
 		if item.Timestamp != "" {
-			timestamp = child.S(item.Timestamp).Data().(string)
+			// If a timestamp is configured, parse it and update the watermark if needed.
+			timevalue, err := time.Parse(item.TimestampFormat, child.S(item.Timestamp).Data().(string))
+			if err != nil {
+				source.processErrors(r, tableName, "", "", data, err)
+			}
+			timestamp = timevalue.Format(time.RFC3339)
+			item.watermarkLock.Lock()
+			if timevalue.After(item.watermark) {
+				item.watermark = timevalue
+			}
+			item.watermarkLock.Unlock()
 		}
 		source.pLock.RLock()
 		for _, f := range source.processEntryCallbacks {
@@ -136,8 +161,13 @@ func (source *Source) processErrors(r *colly.Response, tableName string, id json
 }
 
 func (s *Script) Execute() error {
+	errs := make(chan error, 1)
 	for _, source := range s.Sources {
-		err := source.Limit(&colly.LimitRule{
+		baseURL, err := url.Parse(source.BaseURL)
+		if err != nil {
+			return errors.Wrap(err, "could not parse base URL")
+		}
+		err = source.Limit(&colly.LimitRule{
 			DomainRegexp: ".*",
 			Parallelism:  5,
 		})
@@ -145,8 +175,10 @@ func (s *Script) Execute() error {
 			return errors.Wrap(err, "could not configure Colly limits")
 		}
 		source.SetRequestTimeout(time.Second * 5)
-		source.CacheDir = "./cache"
+		source.AllowURLRevisit = true
 		for tableName, item := range source.Items {
+			item.watermarkLock = &sync.RWMutex{}
+			// TODO: Initialize items from source level defaults.
 			source.OnResponse(func(r *colly.Response) {
 				jsonDecoder := json.NewDecoder(bytes.NewReader(r.Body))
 				jsonDecoder.UseNumber()
@@ -154,16 +186,71 @@ func (s *Script) Execute() error {
 				if err != nil {
 					source.processErrors(r, tableName, "", "", jsonParsed.Data(), err)
 				}
-				source.processEntries(r, tableName, item, jsonParsed)
+				source.processEntries(r, tableName, &item, jsonParsed)
+				ctx := colly.NewContext()
+				ctx.Put("update_source", r.Ctx.Get("update_source"))
+				ctx.Put("update_type", r.Ctx.Get("update_source")+" (following)")
 				for _, selector := range item.Follow {
 					url, ok := jsonParsed.Path(selector).Data().(string)
 					if ok {
-						source.Request("GET", url, nil, nil, source.Headers)
+						source.Request("GET", url, nil, ctx, source.Headers)
 					}
 				}
 			})
-			source.Request("GET", source.BaseURL+item.Path, nil, nil, source.Headers)
+			itemURL := baseURL
+			itemURL.Path = itemURL.Path + item.Path
+			ctx := colly.NewContext()
+			ctx.Put("update_source", "initial")
+			ctx.Put("update_type", "initial")
+			go func() {
+				err := source.Request("GET", itemURL.String(), nil, ctx, source.Headers)
+				if err != nil {
+					errs <- errors.Wrap(err, "initial update request failure")
+				}
+			}()
+			// The initial run is on it's way, now we need to set up timers for subsequent full and incremental runs.
+			frequency, err := time.ParseDuration(item.Update.FullFrequency)
+			if err != nil {
+				return errors.Wrap(err, "could not parse full update frequency")
+			}
+			fullTicker := time.NewTicker(frequency)
+			go func() {
+				for range fullTicker.C {
+					ctx := colly.NewContext()
+					ctx.Put("update_source", "full")
+					ctx.Put("update_type", "full")
+					err := source.Request("GET", itemURL.String(), nil, ctx, source.Headers)
+					if err != nil {
+						errs <- errors.Wrap(err, "full update request failure")
+					}
+				}
+			}()
+			frequency, err = time.ParseDuration(item.Update.IncrementalFrequency)
+			if err != nil {
+				return errors.Wrap(err, "could not parse incremental update frequency")
+			}
+			incrementalTicker := time.NewTicker(frequency)
+			go func() {
+				for range incrementalTicker.C {
+					ctx := colly.NewContext()
+					ctx.Put("update_source", "incremental")
+					ctx.Put("update_type", "incremental")
+					// Make a copy to avoid updating itemURL.
+					updateURL, _ := url.Parse(itemURL.String())
+					q := updateURL.Query()
+					item.watermarkLock.RLock()
+					q.Set(item.Update.IncrementalKey, fmt.Sprintf(item.Update.IncrementalValue, item.watermark.Format(item.Update.IncrementalFormat)))
+					item.watermarkLock.RUnlock()
+					updateURL.RawQuery = q.Encode()
+					err := source.Request("GET", updateURL.String(), nil, ctx, source.Headers)
+					if err != nil {
+						errs <- errors.Wrap(err, "incremental update request failure")
+					}
+				}
+			}()
 		}
 	}
-	return nil
+	// Block here until we recieve an error.
+	err := <-errs
+	return err
 }
